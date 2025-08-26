@@ -1,0 +1,14 @@
+{
+  "id": "glide-zip-downloader",
+  "name": "ZIP Downloader",
+  "description": "Receives a list of file URLs (images/documents) from Glide and lets users download them as a single .zip.",
+  "component_type": "custom-code",
+  "author": "Your Name",
+  "version": "1.0.0",
+  "main": "index.html",
+  "driver": "driver.js",
+  "function": "function.js",
+  "props": ["urls", "zipName", "requestHeaders"],
+  "actions": ["downloadComplete", "error"],
+  "permissions": []
+}
