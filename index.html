@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Glide ZIP Downloader</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.13.5/cdn.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="color-scheme" content="light dark">
+  <style>
+    [x-cloak]{display:none !important}
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100 p-4">
+  <div
+    x-data="zipDownloader()"
+    x-init="init()"
+    class="max-w-xl mx-auto bg-white dark:bg-gray-800 p-6 rounded-lg shadow"
+  >
+    <h1 class="text-2xl font-semibold mb-2">ZIP Downloader</h1>
+    <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">
+      Bundles the provided file URLs into a single <code>.zip</code> and downloads it.
+    </p>
+
+    <div class="space-y-2 max-h-40 overflow-auto border border-gray-200 dark:border-gray-700 rounded p-3 text-xs">
+      <template x-if="urls.length === 0">
+        <div class="text-gray-400">No URLs provided. Bind <code>props.urls</code> in Glide.</div>
+      </template>
+      <template x-for="u in urls" :key="u">
+        <div class="truncate" x-text="u"></div>
+      </template>
+    </div>
+
+    <div class="mt-4 flex items-center gap-2">
+      <button
+        class="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+        :disabled="downloading || urls.length === 0"
+        @click="downloadZip"
+      >
+        <span x-show="!downloading">Download ZIP</span>
+        <span x-show="downloading">Working…</span>
+      </button>
+
+      <div class="text-xs text-gray-500" x-show="downloading" x-cloak>
+        <span x-text="`Downloaded ${completed}/${urls.length}`"></span>
+      </div>
+    </div>
+
+    <!-- Progress bar -->
+    <div class="mt-3" x-show="downloading" x-cloak>
+      <div class="w-full bg-gray-200 dark:bg-gray-700 rounded h-2 overflow-hidden">
+        <div class="bg-blue-600 h-2 transition-all"
+             :style="`width:${progressPct}%;`"></div>
+      </div>
+      <div class="mt-1 text-xs text-gray-500" x-text="statusText"></div>
+    </div>
+
+    <!-- Errors -->
+    <div class="mt-3 text-xs text-red-600 space-y-1" x-show="errors.length" x-cloak>
+      <div class="font-semibold">Some files failed to download:</div>
+      <template x-for="e in errors" :key="e.url">
+        <div><span class="font-mono" x-text="e.file"></span>: <span x-text="e.msg"></span></div>
+      </template>
+    </div>
+  </div>
+
+  <script>
+    function zipDownloader () {
+      return {
+        // Reactive state
+        urls: [],
+        zipName: 'download.zip',
+        headers: {}, // key:value map
+        downloading: false,
+        completed: 0,
+        progressPct: 0,
+        statusText: '',
+        errors: [],
+
+        init() {
+          // Accept inputs from Glide
+          // props.urls: array of strings
+          // props.zipName: string (optional)
+          // props.requestHeaders: array of "Key: Value" strings (optional)
+          try {
+            if (Array.isArray(props?.urls)) this.urls = props.urls.filter(Boolean);
+            if (typeof props?.zipName === 'string' && props.zipName.trim()) {
+              this.zipName = props.zipName.endsWith('.zip') ? props.zipName : `${props.zipName}.zip`;
+            }
+            if (Array.isArray(props?.requestHeaders)) {
+              this.headers = props.requestHeaders.reduce((acc, line) => {
+                const i = String(line).indexOf(':');
+                if (i > -1) { acc[line.slice(0,i).trim()] = line.slice(i+1).trim(); }
+                return acc;
+              }, {});
+            }
+          } catch (e) {
+            console.warn('Init parsing error', e);
+          }
+        },
+
+        async downloadZip() {
+          if (!this.urls.length) return;
+          this.downloading = true;
+          this.completed = 0;
+          this.errors = [];
+          this.progressPct = 0;
+          this.statusText = 'Starting…';
+
+          const zip = new JSZip();
+          const folder = zip.folder('files');
+          const controller = new AbortController();
+
+          // Fetch with limited concurrency to be kind to servers
+          const concurrency = 4;
+          const queue = this.urls.slice();
+          const workers = Array.from({length: concurrency}, () => this.worker(queue, folder, controller));
+
+          try {
+            await Promise.all(workers);
+            this.statusText = 'Creating ZIP…';
+            const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+            saveAs(blob, this.zipName);
+            this.statusText = 'Done';
+            if (actions?.downloadComplete) actions.downloadComplete();
+          } catch (err) {
+            console.error(err);
+            this.statusText = 'Unexpected error creating ZIP';
+            if (actions?.error) actions.error(String(err?.message || err));
+          } finally {
+            this.downloading = false;
+          }
+        },
+
+        async worker(queue, folder, controller) {
+          while (queue.length) {
+            const url = queue.shift();
+            if (!url) break;
+            const fileName = this.deriveFileName(url);
+            try {
+              this.statusText = `Fetching ${fileName}…`;
+              const resp = await fetch(url, {
+                headers: this.headers,
+                cache: 'no-store',
+                signal: controller.signal,
+                // mode: 'cors' // leave default; servers must allow CORS for browser downloads
+              });
+              if (!resp.ok) throw new Error(`${resp.status} ${resp.statusText}`);
+
+              const blob = await resp.blob();
+              folder.file(fileName, blob);
+            } catch (err) {
+              console.warn('Fetch failed', url, err);
+              this.errors.push({ url, file: fileName, msg: String(err?.message || err) });
+            } finally {
+              this.completed++;
+              this.progressPct = Math.round((this.completed / this.urls.length) * 100);
+            }
+          }
+        },
+
+        deriveFileName(url) {
+          try {
+            const u = new URL(url);
+            let name = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || 'file');
+            if (!/\.[a-z0-9]{2,6}$/i.test(name)) {
+              // Append extension hint from content-type if missing (fallback handled by browser when unzipped)
+              const ext = this.extFromQuery(u.search) || '';
+              if (ext) name += ext;
+            }
+            // sanitize
+            name = name.replace(/[\\:*?"<>|]/g, '_');
+            return name;
+          } catch {
+            return 'file';
+          }
+        },
+
+        extFromQuery(search) {
+          if (!search) return '';
+          const params = new URLSearchParams(search);
+          const f = params.get('format') || params.get('ext') || '';
+          if (f && /^[a-z0-9]+$/i.test(f)) return '.' + f.toLowerCase();
+          return '';
+        },
+      };
+    }
+  </script>
+</body>
+</html>
